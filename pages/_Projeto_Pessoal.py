@@ -9,6 +9,11 @@ if not os.path.exists('data'):
     
 ARQUIVO_DADOS = 'data/conversoes.json'
 
+# Cache das cotações (fallback quando a API estiver rate-limited)
+ARQUIVO_COTACOES_CACHE = 'data/last_cotacoes.json'
+# TTL em segundos para reutilizar o cache antes de forçar nova chamada (padrão: 5 minutos)
+CACHE_TTL = 5 * 60
+
 def carregar_historico():
     if not os.path.exists(ARQUIVO_DADOS):
         return []
@@ -23,14 +28,64 @@ def salvar_historico(historico):
         json.dump(historico, f, indent=4) 
 
 def obter_cotacoes():
-    try:
-        url = "https://economia.awesomeapi.com.br/json/last/USD-BRL,EUR-BRL,BTC-BRL,JPY-BRL"
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        st.error(f"Erro ao obter cotações da API: {e}")
-        return None
+    # Implementa retry com backoff exponencial e fallback para cache local.
+    url = "https://economia.awesomeapi.com.br/json/last/USD-BRL,EUR-BRL,BTC-BRL,JPY-BRL"
+    max_retries = 3
+    backoff_factor = 1
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, timeout=5)
+
+            # Tratamento específico para 429 (Too Many Requests)
+            if response.status_code == 429:
+                retry_after = response.headers.get('Retry-After')
+                try:
+                    wait = int(retry_after) if retry_after is not None else backoff_factor * attempt
+                except ValueError:
+                    wait = backoff_factor * attempt
+
+                st.warning(f"API respondeu 429 (Too Many Requests). Aguardando {wait}s antes de tentar novamente...")
+                time.sleep(wait)
+                continue
+
+            response.raise_for_status()
+            cotacoes = response.json()
+            # Salva no cache local para uso futuro caso a API fique indisponível
+            try:
+                with open(ARQUIVO_COTACOES_CACHE, 'w') as f:
+                    json.dump({'timestamp': time.time(), 'cotacoes': cotacoes}, f)
+            except Exception:
+                pass
+
+            return cotacoes
+
+        except requests.exceptions.RequestException as e:
+            # Em erros de rede/timeout, faz backoff e tenta novamente
+            if attempt < max_retries:
+                wait = backoff_factor * attempt
+                time.sleep(wait)
+                continue
+            # Última tentativa falhou: tenta usar cache local como fallback
+            st.error(f"Erro ao obter cotações da API: {e}")
+
+            if os.path.exists(ARQUIVO_COTACOES_CACHE):
+                try:
+                    with open(ARQUIVO_COTACOES_CACHE, 'r') as f:
+                        cache = json.load(f)
+                        age = time.time() - cache.get('timestamp', 0)
+                        cotacoes_cache = cache.get('cotacoes')
+
+                        if cotacoes_cache:
+                            if age <= CACHE_TTL:
+                                st.info("Usando cotações do cache local (recente).")
+                            else:
+                                st.warning("Usando cotações do cache local (pode estar desatualizado).")
+                            return cotacoes_cache
+                except Exception:
+                    pass
+
+            return None
 
 def busca_recursiva(lista, termo_buscado, index=0):
     if index >= len(lista):
